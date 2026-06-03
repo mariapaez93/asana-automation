@@ -1,141 +1,93 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
-const crypto = require("crypto");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const PROJECT_GID = process.env.ASANA_PROJECT_GID;
 
-const SUBTASK_TEMPLATES = [
-  { name: "Copy Due",            offsetDays: -14 },
-  { name: "Client's Approval",   offsetDays: -12 },
-  { name: "Klaviyo Setup",       offsetDays: -10 },
-  { name: "Scheduled",           offsetDays: -7  },
-];
+const SUBTASK_OFFSETS = {
+  "copy due":           -14,
+  "client's approval":  -12,
+  "klaviyo setup":      -10,
+  "scheduled":          -7,
+};
 
-function calculateDate(mainDueDate, offsetDays) {
-  const date = new Date(mainDueDate);
-  date.setDate(date.getDate() + offsetDays);
-  return date.toISOString().split("T")[0];
+function addDays(dateStr, days) {
+  const d = new Date(dateStr);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().split("T")[0];
 }
 
-function getAsana() {
-  return axios.create({
-    baseURL: "https://app.asana.com/api/1.0",
-    headers: { 
-      Authorization: `Bearer ${process.env.ASANA_TOKEN.trim()}`,
+function asanaRequest(method, path, data) {
+  const token = process.env.ASANA_TOKEN || "";
+  return axios({
+    method,
+    url: "https://app.asana.com/api/1.0" + path,
+    headers: {
+      "Authorization": "Bearer " + token.trim(),
       "Content-Type": "application/json"
     },
+    data
   });
 }
 
-async function sendSlack(text) {
-  if (!process.env.SLACK_WEBHOOK_URL) return;
-  await axios.post(process.env.SLACK_WEBHOOK_URL, { text }).catch(e => console.error("[Slack]", e.message));
-}
-
 async function processDueDateChange(taskGid) {
-  try {
-    const asana = getAsana();
-    const { data: { data: task } } = await asana.get(`/tasks/${taskGid}`, {
-      params: { opt_fields: "gid,name,due_on,parent" }
-    });
+  const { data: { data: task } } = await asanaRequest("get", "/tasks/" + taskGid + "?opt_fields=gid,name,due_on,parent");
+  if (!task.due_on || task.parent) return;
 
-    if (!task.due_on || task.parent) return;
+  console.log("Task: " + task.name + " | Due: " + task.due_on);
 
-    console.log(`[Auto] Task: "${task.name}" | Due: ${task.due_on}`);
+  const { data: { data: subtasks } } = await asanaRequest("get", "/tasks/" + taskGid + "/subtasks?opt_fields=gid,name,due_on");
+  if (!subtasks || !subtasks.length) return;
 
-    const { data: { data: subtasks } } = await asana.get(`/tasks/${taskGid}/subtasks`, {
-      params: { opt_fields: "gid,name,due_on" }
-    });
-
-    if (!subtasks?.length) return;
-
-    const updated = [];
-
-    for (const subtask of subtasks) {
-      const template = SUBTASK_TEMPLATES.find(t =>
-        subtask.name.toLowerCase().includes(t.name.toLowerCase())
-      );
-      if (!template) continue;
-
-      const newDate = calculateDate(task.due_on, template.offsetDays);
-      if (subtask.due_on === newDate) continue;
-
-      await asana.put(`/tasks/${subtask.gid}`, { data: { due_on: newDate } });
-      updated.push(`• *${subtask.name}* → ${newDate}`);
-      console.log(`[Auto] "${subtask.name}" → ${newDate}`);
-    }
-
-    if (updated.length > 0) {
-      await sendSlack(`📅 *Due dates actualizados para "${task.name}":*\n${updated.join("\n")}`);
-    }
-  } catch (err) {
-    console.error("[Auto] Error:", err.response?.data || err.message);
+  for (const sub of subtasks) {
+    const key = Object.keys(SUBTASK_OFFSETS).find(k => sub.name.toLowerCase().includes(k));
+    if (!key) continue;
+    const newDate = addDays(task.due_on, SUBTASK_OFFSETS[key]);
+    if (sub.due_on === newDate) continue;
+    await asanaRequest("put", "/tasks/" + sub.gid, { data: { due_on: newDate } });
+    console.log("Updated " + sub.name + " -> " + newDate);
   }
 }
 
 app.post("/webhook", (req, res) => {
-  const hookSecret = req.headers["x-hook-secret"];
-  if (hookSecret) {
-    res.setHeader("X-Hook-Secret", hookSecret);
-    return res.status(200).send();
-  }
-
+  const secret = req.headers["x-hook-secret"];
+  if (secret) { res.setHeader("X-Hook-Secret", secret); return res.sendStatus(200); }
   const events = req.body.events || [];
-  for (const event of events) {
-    if (
-      event.resource?.resource_type === "task" &&
-      event.action === "changed" &&
-      event.change?.field === "due_on"
-    ) {
-      processDueDateChange(event.resource.gid).catch(console.error);
+  for (const e of events) {
+    if (e.resource?.resource_type === "task" && e.action === "changed" && e.change?.field === "due_on") {
+      processDueDateChange(e.resource.gid).catch(err => console.error(err.message));
     }
   }
-
-  res.status(200).send("OK");
+  res.sendStatus(200);
 });
 
 app.get("/setup-webhook", async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).json({ error: "Falta ?url=https://tu-app.railway.app" });
-
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "Falta ?url=https://tu-app" });
   try {
-    const asana = getAsana();
-    const { data } = await asana.post("/webhooks", {
+    const { data } = await asanaRequest("post", "/webhooks", {
       data: {
-        resource: PROJECT_GID,
-        target: `${targetUrl}/webhook`,
-        filters: [{ resource_type: "task", action: "changed", fields: ["due_on"] }],
-      },
+        resource: process.env.ASANA_PROJECT_GID,
+        target: url + "/webhook",
+        filters: [{ resource_type: "task", action: "changed", fields: ["due_on"] }]
+      }
     });
     res.json({ ok: true, webhook: data.data });
-  } catch (err) {
-    res.status(500).json({ error: err.response?.data || err.message });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data || e.message });
   }
 });
 
-app.get("/health", (req, res) => res.json({ 
-  status: "ok", 
-  project: PROJECT_GID,
-  tokenStart: process.env.ASANA_TOKEN?.substring(0,8)
-}));
-
-app.get("/debug-token", async (req, res) => {
+app.get("/health", async (req, res) => {
   try {
-    const asana = getAsana();
-    const result = await asana.get("/users/me");
-    res.json({ ok: true, user: result.data.data.name });
-  } catch (err) {
-    res.json({ 
-      error: err.response?.data, 
-      tokenLength: process.env.ASANA_TOKEN?.length,
-      tokenStart: process.env.ASANA_TOKEN?.substring(0,8)
-    });
+    const { data } = await asanaRequest("get", "/users/me?opt_fields=name");
+    res.json({ status: "ok", asana_user: data.data.name, project: process.env.ASANA_PROJECT_GID });
+  } catch (e) {
+    res.json({ status: "error", message: e.response?.data || e.message, token_present: !!process.env.ASANA_TOKEN });
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Corriendo en puerto ${PORT} | Proyecto: ${PROJECT_GID}`));
+app.listen(PORT, () => console.log("Running on port " + PORT));
